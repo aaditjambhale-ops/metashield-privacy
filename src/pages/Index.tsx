@@ -2,6 +2,7 @@ import Navbar from "@/components/Navbar";
 import HeroSection from "@/components/HeroSection";
 import WhySection from "@/components/WhySection";
 import TransparencyReport from "@/components/TransparencyReport";
+import CloudStorageSection from "@/components/CloudStorageSection";
 import { Shield } from "lucide-react";
 
 const Index = () => {
@@ -11,6 +12,7 @@ const Index = () => {
       <HeroSection />
       <WhySection />
       <TransparencyReport />
+      <CloudStorageSection />
 
       {/* Footer */}
       <footer className="border-t border-border/30 py-10 px-6">
