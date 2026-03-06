@@ -113,6 +113,6 @@ export async function sanitizePdf(file: File): Promise<Blob> {
   pdfDoc.setModificationDate(new Date(0));
 
   const cleanedBytes = await pdfDoc.save();
-  return new Blob([cleanedBytes], { type: "application/pdf" });
+  return new Blob([cleanedBytes.buffer as ArrayBuffer], { type: "application/pdf" });
 }
 
