@@ -1,28 +1,36 @@
 import { useState, useCallback } from "react";
 import { Upload, X, FileText, MapPin, Smartphone, User, Trash2, Download, AlertTriangle, CheckCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import type { DetectedMetadataField, RiskLevel } from "@/lib/metadata/types";
+import { analyzeFile } from "@/lib/sanitize/sanitizeFile";
+import { sanitizeFile } from "@/lib/sanitize/sanitizeFile";
+import { downloadBlob } from "@/lib/download";
+import { toast } from "@/components/ui/sonner";
+
+type MetadataIcon = typeof MapPin;
 
 interface MetadataField {
   id: string;
-  icon: React.ElementType;
+  icon: MetadataIcon;
   label: string;
   value: string;
   removed: boolean;
 }
 
+type FileStatus = "detecting" | "ready" | "sanitizing" | "clean_ready" | "unsupported" | "error";
+
 interface FileReport {
+  id: string;
+  originalFile: File;
   name: string;
   size: string;
   riskPercent: number;
-  riskLevel: "Low" | "Medium" | "High";
+  riskLevel: RiskLevel;
   metadata: MetadataField[];
+  status: FileStatus;
+  cleanBlob?: Blob;
+  cleanFileName?: string;
 }
-
-const classifyRisk = (percent: number): "Low" | "Medium" | "High" => {
-  if (percent <= 30) return "Low";
-  if (percent <= 60) return "Medium";
-  return "High";
-};
 
 const riskColors: Record<string, string> = {
   Low: "bg-success/15 text-success border-success/20",
@@ -30,28 +38,74 @@ const riskColors: Record<string, string> = {
   High: "bg-destructive/15 text-destructive border-destructive/20",
 };
 
-const generateMockReport = (file: File): FileReport => {
-  const riskPercent = Math.floor(Math.random() * 70) + 20;
-  return {
-    name: file.name,
-    size: (file.size / 1024).toFixed(1) + " KB",
-    riskPercent,
-    riskLevel: classifyRisk(riskPercent),
-    metadata: [
-      { id: "loc", icon: MapPin, label: "Location Found", value: "40.7128° N, 74.0060° W", removed: false },
-      { id: "dev", icon: Smartphone, label: "Device Info", value: "iPhone 13 Pro, iOS 15.4", removed: false },
-      { id: "pid", icon: User, label: "Personal Identifiers", value: "John Doe • 2023-08-15 14:22:01", removed: false },
-    ],
-  };
-};
-
 const TransparencyReport = () => {
   const [files, setFiles] = useState<FileReport[]>([]);
   const [dragging, setDragging] = useState(false);
 
   const handleFiles = useCallback((fileList: FileList) => {
-    const reports = Array.from(fileList).map(generateMockReport);
-    setFiles((prev) => [...prev, ...reports]);
+    const incomingFiles = Array.from(fileList);
+
+    // Optimistically add placeholder entries while we asynchronously analyze
+    const placeholders: FileReport[] = incomingFiles.map((file) => ({
+      id: `${file.name}-${file.size}-${file.lastModified}-${Math.random().toString(36).slice(2)}`,
+      originalFile: file,
+      name: file.name,
+      size: (file.size / 1024).toFixed(1) + " KB",
+      riskPercent: 0,
+      riskLevel: "Low",
+      metadata: [],
+      status: "detecting",
+    }));
+
+    setFiles((prev) => [...prev, ...placeholders]);
+
+    placeholders.forEach((placeholder) => {
+      analyzeFile(placeholder.originalFile)
+        .then((analysis) => {
+          const iconForField = (field: DetectedMetadataField): MetadataIcon => {
+            if (field.category === "location") return MapPin;
+            if (field.category === "device") return Smartphone;
+            if (field.category === "identity") return User;
+            return FileText;
+          };
+
+          const mappedMetadata: MetadataField[] = analysis.metadata.map((m) => ({
+            id: m.id,
+            icon: iconForField(m),
+            label: m.label,
+            value: m.value,
+            removed: false,
+          }));
+
+          setFiles((prev) =>
+            prev.map((f) =>
+              f.id === placeholder.id
+                ? {
+                    ...f,
+                    metadata: mappedMetadata,
+                    riskPercent: analysis.riskPercent,
+                    riskLevel: analysis.riskLevel,
+                    status: "ready",
+                  }
+                : f,
+            ),
+          );
+        })
+        .catch((error) => {
+          console.error("Failed to analyze file metadata", error);
+          toast.error(`Failed to analyze metadata for ${placeholder.name}`);
+          setFiles((prev) =>
+            prev.map((f) =>
+              f.id === placeholder.id
+                ? {
+                    ...f,
+                    status: "error",
+                  }
+                : f,
+            ),
+          );
+        });
+    });
   }, []);
 
   const handleDrop = useCallback(
@@ -84,13 +138,111 @@ const TransparencyReport = () => {
 
   const sanitizeAll = () => {
     setFiles((prev) =>
-      prev.map((f) => ({
-        ...f,
-        metadata: f.metadata.map((m) => ({ ...m, removed: true })),
-        riskPercent: 0,
-        riskLevel: "Low",
-      }))
+      prev.map((f) =>
+        f.status === "ready" || f.status === "clean_ready"
+          ? { ...f, status: "sanitizing" }
+          : f,
+      ),
     );
+
+    files.forEach((file, idx) => {
+      if (file.status !== "ready" && file.status !== "clean_ready") return;
+
+      sanitizeFile(file.originalFile)
+        .then((result) => {
+          setFiles((prev) =>
+            prev.map((f, i) =>
+              i === idx
+                ? {
+                    ...f,
+                    cleanBlob: result.cleanBlob,
+                    cleanFileName: result.cleanFileName,
+                    metadata: f.metadata.map((m) => ({ ...m, removed: true })),
+                    riskPercent: 0,
+                    riskLevel: "Low",
+                    status: "clean_ready",
+                  }
+                : f,
+            ),
+          );
+        })
+        .catch((error) => {
+          console.error("Failed to sanitize file", error);
+          toast.error(`Failed to sanitize ${file.name}`);
+          setFiles((prev) =>
+            prev.map((f, i) =>
+              i === idx
+                ? {
+                    ...f,
+                    status: "error",
+                  }
+                : f,
+            ),
+          );
+        });
+    });
+  };
+
+  const handleDownloadClean = (idx: number) => {
+    const file = files[idx];
+    if (!file) return;
+
+    if (file.status === "detecting" || file.status === "sanitizing") {
+      toast.info("Please wait until analysis completes.");
+      return;
+    }
+
+    if (file.cleanBlob && file.cleanFileName) {
+      downloadBlob(file.cleanBlob, file.cleanFileName);
+      toast.success("Downloading clean file");
+      return;
+    }
+
+    setFiles((prev) =>
+      prev.map((f, i) =>
+        i === idx
+          ? {
+              ...f,
+              status: "sanitizing",
+            }
+          : f,
+      ),
+    );
+
+    sanitizeFile(file.originalFile)
+      .then((result) => {
+        downloadBlob(result.cleanBlob, result.cleanFileName);
+        toast.success("Clean file generated and downloaded");
+        setFiles((prev) =>
+          prev.map((f, i) =>
+            i === idx
+              ? {
+                  ...f,
+                  cleanBlob: result.cleanBlob,
+                  cleanFileName: result.cleanFileName,
+                  metadata: f.metadata.map((m) => ({ ...m, removed: true })),
+                  riskPercent: 0,
+                  riskLevel: "Low",
+                  status: "clean_ready",
+                }
+              : f,
+          ),
+        );
+      })
+      .catch((error) => {
+        console.error("Failed to sanitize file", error);
+        toast.error(`Failed to generate clean version for ${file.name}`);
+        setFiles((prev) =>
+          prev.map((f, i) =>
+            i === idx
+              ? {
+                  ...f,
+                  status: "error",
+                }
+              : f,
+          ),
+        );
+      });
   };
 
   return (
@@ -135,8 +287,10 @@ const TransparencyReport = () => {
             id="file-input"
             type="file"
             multiple
+            accept="image/*,.pdf,.docx,.xlsx,.pptx"
             className="hidden"
             onChange={handleInputChange}
+            aria-label="Upload files for metadata analysis and cleaning"
           />
           <Upload className="h-10 w-10 text-muted-foreground mx-auto mb-4" />
           <p className="font-display text-lg font-semibold text-foreground">
@@ -179,6 +333,11 @@ const TransparencyReport = () => {
                 <p className="text-xs uppercase tracking-wider text-muted-foreground font-semibold">
                   Detected Metadata
                 </p>
+                {file.metadata.length === 0 && (
+                  <p className="text-xs text-muted-foreground">
+                    No metadata detected or file type not supported for deep inspection.
+                  </p>
+                )}
                 {file.metadata.map((m) => (
                   <div
                     key={m.id}
@@ -214,9 +373,14 @@ const TransparencyReport = () => {
               </div>
 
               {/* Download */}
-              <Button variant="gradient" className="w-full sm:w-auto">
+              <Button
+                variant="gradient"
+                className="w-full sm:w-auto"
+                onClick={() => handleDownloadClean(idx)}
+                disabled={file.status === "detecting" || file.status === "sanitizing"}
+              >
                 <Download className="h-4 w-4 mr-2" />
-                Download Clean Version
+                {file.status === "sanitizing" ? "Sanitizing..." : "Download Clean Version"}
               </Button>
             </div>
           ))}
